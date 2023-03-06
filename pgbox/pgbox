@@ -1,0 +1,163 @@
+#! /bin/bash
+set -e
+
+DOCKER=${DOCKER:-docker}
+
+function help() {
+	cat <<EOF
+pgbox - start postgres sandbox as container
+
+Usage:
+
+    pgbox [flags] [--] [PATH]
+
+Arguemnts:
+
+  PATH      Path to a file or directory where contains DDLs.
+            This is used as '/docker-entrypoint-initdb.d' (or its content) in the container.
+            If missing, you will get empty database.
+
+Flags:
+
+  -d, --dbname PGDATABASE       database name.
+                                (default: envvar PGDATABASE, or 'postgres')
+  -U, --username PGUSER         username of database.
+                                (default: envvar PGUSER, or 'postgres')
+  -P, --password PASSWORD       password of database.
+                                (default: generate randomly)
+  -p, --port PGPORT             port to expose.
+                                (default: envvar PGPORT, or 5432)
+  --no-daemon                   start container as non-daemon.
+  -I, --image     IMAGE         image name. (default: postgres)
+  -V, --image-version VERSION   image version. (default: latest)
+  --name                        container name.
+                                (default: pgbox-{RANDOM-SUFFIX})
+  -h, --help, help              show this message.
+
+Environment Variables:
+
+  PGDATABASE, PGUSER, PGPORT    default value of --dbname, --username and --port
+  DOCKER                        path to docker command (or compatible).
+                                pgbox depends on behaviours "docker run" and "docker container inspect".
+
+EOF
+}
+
+function random_alnum() {
+	cat /dev/urandom | base64 | tr -dc '0123456789abcdefghijklmnopqrstuvwxyz' | head -c $1
+}
+
+DAEMON=-d
+
+while [ 0 -lt ${#@} ] ; do
+	ARG=${1}; shift
+	case "${ARG}" in
+		-d|--dbname)
+			PGDATABASE="${1}"; shift
+			;;
+		-U|--username)
+			PGUSER="${1}"; shift
+			;;
+		-P|--password)
+			PGPASSWORD="${1}"; shift
+			;;
+		-p|--port)
+			PGPORT="${1}"; shift
+			;;
+		-I|--image)
+			IMAGE="${1}"; shift
+			;;
+		-V|--image-version)
+			IMAGE_VERSION="${1}"; shift
+			;;
+		--name)
+			CONTAINER_NAME="${1}"; shift
+			;;
+		--no-daemon)
+			DAEMON=
+			;;
+		-h|--help|help)
+			help >&2
+			exit 1
+			;;
+		--)
+			ARG=${1}; shift
+			INITDB=${ARG}
+			;;
+		*)
+			INITDB=${ARG}
+			;;
+	esac
+done
+
+PGDATABASE=${PGDATABASE:-postgres}
+PGUSER=${PGUSER:-postgres}
+PGPASSWORD=${PGPASSWORD:-$(random_alnum 16)}
+PGPORT=${PGPORT:-5432}
+
+IMAGE=${IMAGE:-postgres}
+IMAGE_VERSION=${IMAGE_VERSION:-latest}
+
+NAME=${NAME:-pgbox-$(random_alnum 4)}
+
+MOUNT_TO='/docker-entrypoint-initdb.d'
+
+if [ -d "${INITDB}" ] ; then
+	INITDB=$(cd ${INITDB}; pwd -P)
+elif [ -f "${INITDB}" ] && [ -r "${INITDB}" ] ; then
+	INITDB=$(cd ${INITDB%/*}; pwd -P)/${INITDB##*/}
+	MOUNT_TO="${MOUNT_TO}/ddl.sql"
+elif [ -z ${INITDB} ] ; then
+	echo "! no init scripts are given." >&2
+else
+	echo "'${INITDB}': not directory or readable file." >&2
+	exit 1
+fi
+
+echo "📛 Your container is named '${NAME}'" >&2
+echo "🎁 strating... " >&2
+
+VOL=${INITDB}:${MOUNT_TO}:ro
+CONTAINER_ID=$(
+	${DOCKER} run ${DAEMON} ${INITDB:+-v} "${INITDB:+${VOL}}" \
+		-p "${PGPORT}:5432" \
+		-e "POSTGRES_PASSWORD=${PGPASSWORD}" \
+		-e "POSTGRES_USER=${PGUSER}" \
+		-e "PGUSER=${PGUSER}" \
+		-e "POSTGRES_DB=${PGDATABASE}" \
+		-e "PGDATABASE=${PGDATABASE}" \
+		--name ${NAME} \
+		"${IMAGE}:${IMAGE_VERSION}"
+)
+
+if ! [ 0 = $? ] ; then
+	exit 1
+fi
+
+while : ; do
+	STATUS=$(${DOCKER} container inspect ${NAME} --format '{{.State.Status}}')
+	case ${STATUS} in
+	created) continue ;;
+	running) break ;;
+	*)
+		(
+			echo "💣 container does not start."
+			echo "========= CONTAINER LOG ========="
+			${DOCKER} logs ${NAME}
+			echo "================================="
+		) >&2
+		exit 1
+	;;
+	esac
+done
+
+cat <<EOF >&2
+🚢 Container seems started!
+
+Your postgres may be accessible by... (if ${DOCKER} is compatible with docker)
+
+  ${DOCKER} exec -it ${NAME} psql
+
+EOF
+
+
